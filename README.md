@@ -135,10 +135,10 @@ curl -X POST 'https://your-domain/admin/devices' \
 ## Pre v85 Firmware
 static.network.vpn.mode="1"
 static.network.vpn_enable="1"
-static.network.openvpn_file.url="https://{yourdomain}/vpn/vpn.cnf?token={token}"
+static.network.openvpn_file.url="https://{yourdomain}/vpn/vpn.cnf?token={prov_token}"
 ## v85 and up
 static.network.vpn_enable="1"
-static.network.vpn.cnf.url="https://{yourdomain}/vpn/vpn.cnf?token={token}"
+static.network.vpn.cnf.url="https://{yourdomain}/vpn/vpn.cnf?token={prov_token}"
 ```
 
 On first contact the phone is auto-registered, a certificate is generated via Easy-RSA, and the OpenVPN bundle is cached for subsequent downloads.
