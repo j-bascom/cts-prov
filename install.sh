@@ -221,6 +221,14 @@ collect_config() {
         warn "Port must be 1–65535"
     done
 
+    while true; do
+        ask VPN_SUBNET "OpenVPN tunnel subnet (CIDR)" "${VPN_SUBNET:-10.8.0.0/20}"
+        if [[ "$VPN_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+            break
+        fi
+        warn "Invalid CIDR — example: 10.8.0.0/20"
+    done
+
     echo
     echo "  PROV_TOKEN — optional shared secret Yealink phones present when"
     echo "  fetching configs. Press ENTER to auto-generate (recommended)."
@@ -289,7 +297,7 @@ collect_config() {
         WG_ENABLED=yes
 
         while true; do
-            ask WG_SUBNET "WireGuard subnet (must not overlap 10.8.0.0/24)" "${WG_SUBNET:-10.9.0.0/24}"
+            ask WG_SUBNET "WireGuard subnet (must not overlap $VPN_SUBNET)" "${WG_SUBNET:-10.9.0.0/24}"
             if [[ "$WG_SUBNET" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
                 break
             fi
@@ -416,6 +424,7 @@ show_review() {
     printf "  %-24s %s\n" "TLS mode:"         "$TLS_MODE"
     printf "  %-24s %s\n" "SkySwitch URL:"    "$SKYSWITCH_PROV_URL"
     printf "  %-24s %s\n" "OpenVPN port:"     "${VPN_PORT}/udp"
+    printf "  %-24s %s\n" "OpenVPN subnet:"   "$VPN_SUBNET"
     printf "  %-24s %s\n" "PROV_TOKEN:"       "(set, ${#PROV_TOKEN} chars)"
     printf "  %-24s %s\n" "ADMIN_TOKEN:"      "(set, ${#ADMIN_TOKEN} chars — shown after install)"
     printf "  %-24s %s\n" "Dashboard user:"   "$DASHBOARD_USER"
@@ -461,6 +470,7 @@ SKYSWITCH_PROV_URL=$SKYSWITCH_PROV_URL
 VPN_PORT=$VPN_PORT
 ADMIN_TOKEN=$ADMIN_TOKEN
 PROV_TOKEN=$PROV_TOKEN
+VPN_SUBNET=${VPN_SUBNET:-10.8.0.0/20}
 DASHBOARD_USER=$DASHBOARD_USER
 DASHBOARD_PASSWORD=$DASHBOARD_PASSWORD
 WG_ENABLED=${WG_ENABLED:-no}
@@ -567,7 +577,7 @@ run_verification() {
     vcheck "HTTPS responding"         "curl -sf --max-time 10 -k https://$PROV_DOMAIN/health"
     vcheck "Easy-RSA CA present"      "test -f '$PKI_DIR/ca.crt'"
     vcheck "tun0 interface up"        "ip link show tun0"
-    vcheck "NAT masquerade rule"      "iptables -t nat -L POSTROUTING -n | grep -q 10.8.0.0"
+    vcheck "NAT masquerade rule"      "iptables -t nat -L POSTROUTING -n | grep -q $(echo ${VPN_SUBNET:-10.8.0.0/20} | cut -d/ -f1)"
     vcheck "CRL cron installed"       "test -f /etc/cron.d/cts-crl-renewal"
     vcheck "fail2ban jail active"     "fail2ban-client status cts-admin"
 
