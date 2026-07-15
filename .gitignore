@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Runtime state
+devices.db
+cache/
+wireguard-clients/
+
+# Build artifacts
+*.run
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/

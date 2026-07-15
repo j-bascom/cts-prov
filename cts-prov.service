@@ -1,0 +1,19 @@
+[Unit]
+Description=CTS Provisioning Proxy
+Documentation=file:///opt/cts-prov/CLAUDE.md
+After=network.target openvpn-server@server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cts-prov
+EnvironmentFile=/opt/cts-prov/.env
+ExecStart=/opt/cts-prov/venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000 --log-level info
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cts-prov
+
+[Install]
+WantedBy=multi-user.target

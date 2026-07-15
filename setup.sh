@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+# setup.sh — Full automated setup for CTS provisioning proxy + OpenVPN
+# Intended to be called by install.sh after it writes .env
+# Can also be run directly on a server that already has .env filled in.
+# Run as root: bash setup.sh
+
+set -euo pipefail
+
+# ── Load config ───────────────────────────────────────────────────────────────
+if [ ! -f /opt/cts-prov/.env ]; then
+    echo "ERROR: /opt/cts-prov/.env not found."
+    echo "Run install.sh to configure interactively, or copy .env.example and fill it in."
+    exit 1
+fi
+set -a; source /opt/cts-prov/.env; set +a
+
+DOMAIN=$(echo "$PROV_DOMAIN" | sed 's|https://||')
+IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+TLS_MODE="${TLS_MODE:-letsencrypt}"
+WG_ENABLED="${WG_ENABLED:-no}"
+
+echo "=== CTS Provisioning Proxy Setup ==="
+echo "Domain:    $DOMAIN"
+echo "Public IP: $VULTR_PUBLIC_IP"
+echo "Interface: $IFACE"
+echo "TLS mode:  $TLS_MODE"
+echo "WireGuard: $WG_ENABLED"
+echo ""
+
+# ── 1. System packages ────────────────────────────────────────────────────────
+echo "[1/10] Installing system packages..."
+apt-get update -qq
+PKGS="python3 python3-pip python3-venv openvpn easy-rsa nginx certbot python3-certbot-nginx sqlite3 iptables iptables-persistent curl openssl dnsutils fail2ban"
+[ "$WG_ENABLED" = "yes" ] && PKGS="$PKGS wireguard"
+apt-get install -y $PKGS
+
+# ── 2. Easy-RSA CA ────────────────────────────────────────────────────────────
+echo "[2/10] Setting up Easy-RSA CA..."
+mkdir -p /etc/openvpn/easy-rsa
+cp -rn /usr/share/easy-rsa/. /etc/openvpn/easy-rsa/ 2>/dev/null || true
+chmod +x /etc/openvpn/easy-rsa/easyrsa
+
+cd /etc/openvpn/easy-rsa
+
+if [ ! -f "$PKI_DIR/ca.crt" ]; then
+    ./easyrsa init-pki
+    ./easyrsa --batch build-ca nopass
+    echo "CA initialized."
+else
+    echo "CA already exists, skipping."
+fi
+
+# ── 3. OpenVPN server cert + DH ───────────────────────────────────────────────
+echo "[3/10] Setting up OpenVPN server certs..."
+mkdir -p /etc/openvpn/server /var/log/openvpn
+
+if [ ! -f "$PKI_DIR/issued/server.crt" ]; then
+    ./easyrsa --batch build-server-full server nopass
+fi
+
+if [ ! -f "$PKI_DIR/dh.pem" ]; then
+    echo "Generating DH params (this takes ~60 seconds — normal)..."
+    ./easyrsa gen-dh
+fi
+
+if [ ! -f "/etc/openvpn/server/ta.key" ]; then
+    openvpn --genkey secret /etc/openvpn/server/ta.key
+fi
+
+# Generate initial CRL
+./easyrsa --batch gen-crl 2>/dev/null || true
+
+cp "$PKI_DIR/ca.crt"             /etc/openvpn/server/
+cp "$PKI_DIR/issued/server.crt"  /etc/openvpn/server/
+cp "$PKI_DIR/private/server.key" /etc/openvpn/server/
+cp "$PKI_DIR/dh.pem"             /etc/openvpn/server/
+
+chmod 600 /etc/openvpn/server/server.key /etc/openvpn/server/ta.key
+
+# ── 4. OpenVPN server config ──────────────────────────────────────────────────
+echo "[4/10] Writing OpenVPN server config..."
+cp /opt/cts-prov/server.conf /etc/openvpn/server/server.conf
+
+systemctl enable openvpn-server@server
+systemctl restart openvpn-server@server
+echo "OpenVPN server started."
+
+# ── 5. IP forwarding + iptables NAT ──────────────────────────────────────────
+echo "[5/10] Configuring iptables NAT..."
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-cts-prov.conf
+sysctl -p /etc/sysctl.d/99-cts-prov.conf -q
+
+# Idempotent — check before adding
+if ! iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o "$IFACE" -j MASQUERADE 2>/dev/null; then
+    iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o "$IFACE" -j MASQUERADE
+fi
+if ! iptables -C FORWARD -i tun0 -o tun0 -j DROP 2>/dev/null; then
+    iptables -A FORWARD -i tun0 -o tun0 -j DROP
+fi
+if ! iptables -C FORWARD -i tun0 -o "$IFACE" -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i tun0 -o "$IFACE" -j ACCEPT
+fi
+if ! iptables -C FORWARD -i "$IFACE" -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; then
+    iptables -A FORWARD -i "$IFACE" -o tun0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+fi
+
+netfilter-persistent save
+echo "NAT configured on $IFACE."
+
+# ── 6. Python venv + app ──────────────────────────────────────────────────────
+echo "[6/10] Setting up Python environment..."
+cd /opt/cts-prov
+python3 -m venv venv
+./venv/bin/pip install -q --upgrade pip
+./venv/bin/pip install -q -r requirements.txt
+
+mkdir -p cache/certs cache/output
+chmod 700 cache
+
+# ── 7. Nginx + TLS ────────────────────────────────────────────────────────────
+echo "[7/10] Configuring Nginx + TLS ($TLS_MODE)..."
+
+rm -f /etc/nginx/sites-enabled/default
+
+# Shared proxy location blocks — used in both TLS branches below
+_PROXY_LOCATIONS() {
+cat <<'LOCS'
+    proxy_read_timeout    60s;
+    proxy_connect_timeout 10s;
+    client_max_body_size  10m;
+
+    location /provision/ {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+    location /vpn/ {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+    location /admin/ {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+    location /dashboard {
+        proxy_pass         http://127.0.0.1:8000;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+    location /health { proxy_pass http://127.0.0.1:8000; }
+    location /docs   { proxy_pass http://127.0.0.1:8000; }
+
+    access_log  /var/log/nginx/cts-prov-access.log;
+    error_log   /var/log/nginx/cts-prov-error.log;
+LOCS
+}
+
+if [ "$TLS_MODE" = "selfsigned" ]; then
+    # Generate self-signed certificate valid for 10 years
+    if [ ! -f /etc/ssl/private/cts-prov.key ]; then
+        echo "Generating self-signed certificate..."
+        openssl req -x509 -nodes -newkey rsa:4096 \
+            -keyout /etc/ssl/private/cts-prov.key \
+            -out    /etc/ssl/certs/cts-prov.crt \
+            -days   3650 \
+            -subj   "/C=US/O=CTS-Prov/CN=$DOMAIN" 2>/dev/null
+        chmod 600 /etc/ssl/private/cts-prov.key
+        echo "Self-signed certificate generated."
+    else
+        echo "Self-signed certificate already exists, skipping."
+    fi
+
+    cat > /etc/nginx/sites-available/cts-prov <<NGINXCFG
+server {
+    listen 80;
+    server_name $DOMAIN;
+    location / { return 301 https://\$host\$request_uri; }
+}
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $DOMAIN;
+
+    ssl_certificate     /etc/ssl/certs/cts-prov.crt;
+    ssl_certificate_key /etc/ssl/private/cts-prov.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+$(_PROXY_LOCATIONS)
+}
+NGINXCFG
+
+else
+    # Let's Encrypt — phase 1: HTTP-only so certbot ACME can run
+    cat > /etc/nginx/sites-available/cts-prov <<NGINXHTTP
+server {
+    listen 80;
+    server_name $DOMAIN;
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+NGINXHTTP
+
+    ln -sf /etc/nginx/sites-available/cts-prov /etc/nginx/sites-enabled/cts-prov
+    systemctl enable nginx
+    systemctl restart nginx
+
+    if [ ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]; then
+        certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos \
+            --email "$CERTBOT_EMAIL" \
+            --redirect
+    else
+        echo "TLS cert already exists, skipping certbot."
+    fi
+
+    # Phase 2: Full TLS config now that cert exists
+    cat > /etc/nginx/sites-available/cts-prov <<NGINXFULL
+server {
+    listen 80;
+    server_name $DOMAIN;
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name $DOMAIN;
+
+    ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+$(_PROXY_LOCATIONS)
+}
+NGINXFULL
+fi
+
+ln -sf /etc/nginx/sites-available/cts-prov /etc/nginx/sites-enabled/cts-prov
+nginx -t
+systemctl enable nginx
+systemctl reload nginx
+
+# ── 8. systemd service ────────────────────────────────────────────────────────
+echo "[8/10] Installing systemd service..."
+cp /opt/cts-prov/cts-prov.service /etc/systemd/system/cts-prov.service
+systemctl daemon-reload
+systemctl enable cts-prov
+systemctl restart cts-prov
+
+# ── 9. fail2ban ───────────────────────────────────────────────────────────────
+echo "[9/10] Configuring fail2ban..."
+
+mkdir -p /etc/fail2ban/filter.d
+cp /opt/cts-prov/fail2ban/filter.d/cts-admin.conf /etc/fail2ban/filter.d/
+
+cat > /etc/fail2ban/jail.d/cts-prov.conf <<'JAIL'
+[sshd]
+enabled  = true
+port     = ssh
+maxretry = 5
+bantime  = 3600
+findtime = 600
+
+[cts-admin]
+enabled  = true
+port     = http,https
+filter   = cts-admin
+logpath  = /var/log/nginx/cts-prov-access.log
+maxretry = 5
+bantime  = 3600
+findtime = 600
+JAIL
+
+systemctl enable fail2ban
+systemctl restart fail2ban
+echo "fail2ban configured (SSH + admin API protection)."
+
+# ── 10. WireGuard (optional) ──────────────────────────────────────────────────
+echo "[10/10] WireGuard setup..."
+if [ "$WG_ENABLED" = "yes" ]; then
+    WG_SUBNET="${WG_SUBNET:-10.9.0.0/24}"
+    WG_PORT="${WG_PORT:-51820}"
+    WG_DNS="${WG_DNS:-8.8.8.8,1.1.1.1}"
+    WG_CLIENT_COUNT="${WG_CLIENT_COUNT:-5}"
+
+    WG_SERVER_IP=$(echo "$WG_SUBNET" | awk -F'[./]' '{print $1"."$2"."$3".1"}')
+    WG_CIDR=$(echo "$WG_SUBNET" | cut -d/ -f2)
+
+    mkdir -p /etc/wireguard
+    chmod 700 /etc/wireguard
+
+    if [ ! -f /etc/wireguard/server_private.key ]; then
+        wg genkey | tee /etc/wireguard/server_private.key | wg pubkey > /etc/wireguard/server_public.key
+        chmod 600 /etc/wireguard/server_private.key
+        echo "WireGuard server keys generated."
+    fi
+
+    SERVER_PRIVATE=$(cat /etc/wireguard/server_private.key)
+    SERVER_PUBLIC=$(cat /etc/wireguard/server_public.key)
+
+    if [ ! -f /etc/wireguard/wg0.conf ]; then
+        cat > /etc/wireguard/wg0.conf <<WGSERVER
+[Interface]
+PrivateKey = $SERVER_PRIVATE
+Address    = $WG_SERVER_IP/$WG_CIDR
+ListenPort = $WG_PORT
+PostUp   = iptables -t nat -A POSTROUTING -s $WG_SUBNET -o $IFACE -j MASQUERADE; iptables -A FORWARD -i wg0 -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -s $WG_SUBNET -o $IFACE -j MASQUERADE; iptables -D FORWARD -i wg0 -j ACCEPT
+WGSERVER
+        chmod 600 /etc/wireguard/wg0.conf
+    fi
+
+    mkdir -p /opt/cts-prov/wireguard-clients
+    chmod 700 /opt/cts-prov/wireguard-clients
+
+    WG_DNS_FMT=$(echo "$WG_DNS" | tr ',' ', ')
+
+    for i in $(seq 1 "$WG_CLIENT_COUNT"); do
+        CLIENT_DIR="/opt/cts-prov/wireguard-clients/client$i"
+        if [ -d "$CLIENT_DIR" ]; then
+            echo "  client$i already exists, skipping."
+            continue
+        fi
+        mkdir -p "$CLIENT_DIR"
+        CLIENT_IP=$(echo "$WG_SUBNET" | awk -F'[./]' -v n=$((i+1)) '{print $1"."$2"."$3"."n}')
+
+        wg genkey | tee "$CLIENT_DIR/private.key" | wg pubkey > "$CLIENT_DIR/public.key"
+        chmod 600 "$CLIENT_DIR/private.key"
+
+        CLIENT_PRIVATE=$(cat "$CLIENT_DIR/private.key")
+        CLIENT_PUBLIC=$(cat "$CLIENT_DIR/public.key")
+
+        cat > "$CLIENT_DIR/client$i.conf" <<WGCLIENT
+[Interface]
+PrivateKey = $CLIENT_PRIVATE
+Address    = $CLIENT_IP/32
+DNS        = $WG_DNS_FMT
+
+[Peer]
+PublicKey  = $SERVER_PUBLIC
+Endpoint   = $VULTR_PUBLIC_IP:$WG_PORT
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+WGCLIENT
+        chmod 600 "$CLIENT_DIR/client$i.conf"
+
+        cat >> /etc/wireguard/wg0.conf <<WGPEER
+
+[Peer]
+# client$i
+PublicKey  = $CLIENT_PUBLIC
+AllowedIPs = $CLIENT_IP/32
+WGPEER
+
+        echo "  → client$i: $CLIENT_IP — $CLIENT_DIR/client$i.conf"
+    done
+
+    # Install the gen-client helper alongside client configs
+    if [ -f /opt/cts-prov/wireguard/gen-client.sh ]; then
+        cp /opt/cts-prov/wireguard/gen-client.sh /opt/cts-prov/wireguard-clients/gen-client.sh
+        chmod +x /opt/cts-prov/wireguard-clients/gen-client.sh
+    fi
+
+    systemctl enable wg-quick@wg0
+    systemctl restart wg-quick@wg0
+    echo "WireGuard running on UDP $WG_PORT — clients in /opt/cts-prov/wireguard-clients/"
+else
+    echo "WireGuard: skipped (WG_ENABLED=no)."
+fi
+
+# ── Verification ──────────────────────────────────────────────────────────────
+echo ""
+echo "=== Verification ==="
+sleep 2
+
+check() {
+    local name="$1"; local cmd="$2"
+    if eval "$cmd" &>/dev/null; then
+        echo "  ✓ $name"
+    else
+        echo "  ✗ $name  <-- CHECK THIS"
+    fi
+}
+
+check "OpenVPN running"      "systemctl is-active --quiet openvpn-server@server"
+check "cts-prov running"     "systemctl is-active --quiet cts-prov"
+check "Nginx running"        "systemctl is-active --quiet nginx"
+check "fail2ban running"     "systemctl is-active --quiet fail2ban"
+[ "$WG_ENABLED" = "yes" ] && \
+check "WireGuard running"    "systemctl is-active --quiet wg-quick@wg0"
+check "FastAPI responding"   "curl -sf http://127.0.0.1:8000/health"
+check "HTTPS responding"     "curl -sf -k https://$DOMAIN/health"
+check "Easy-RSA CA present"  "test -f $PKI_DIR/ca.crt"
+check "tun0 interface up"    "ip link show tun0"
+check "NAT rule present"     "iptables -t nat -L POSTROUTING -n | grep -q 10.8.0.0"
+
+echo ""
+echo "=== Setup complete ==="
+echo ""
+echo "Next steps:"
+echo "  1. Add phones:  curl -X POST 'https://$DOMAIN/admin/devices'"
+echo "                       -H 'X-Admin-Token: \$ADMIN_TOKEN'"
+echo "                       -d 'mac=aabbccdd1122&label=Lobby&tenant=acme'"
+echo ""
+echo "  2. Set YMCS provisioning URL to:"
+echo "     https://$DOMAIN/provision/provision.cfg"
+echo ""
+echo "  3. Dashboard: https://$DOMAIN/dashboard"
