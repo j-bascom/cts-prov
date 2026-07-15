@@ -26,6 +26,7 @@ mkdir -p "$STAGING"
 
 rsync -a \
     --exclude='.env' \
+    --exclude='.git/' \
     --exclude='venv/' \
     --exclude='cache/' \
     --exclude='devices.db' \
