@@ -130,8 +130,15 @@ curl -X POST 'https://your-domain/admin/devices' \
      -H 'X-Admin-Token: your-token' \
      -G -d 'mac=aabbccdd1122' -d 'label=Lobby' -d 'tenant=acme'
 
-# Set the YMCS provisioning URL in SkySwitch to:
-https://your-domain/provision/provision.cfg
+# Set the overrides in NDP
+
+## Pre v85 Firmware
+static.network.vpn.mode="1"
+static.network.vpn_enable="1"
+static.network.openvpn_file.url="https://{yourdomain}/vpn/vpn.cnf?token={token}"
+## v85 and up
+static.network.vpn_enable="1"
+static.network.vpn.cnf.url="https://{yourdomain}/vpn/vpn.cnf?token={token}"
 ```
 
 On first contact the phone is auto-registered, a certificate is generated via Easy-RSA, and the OpenVPN bundle is cached for subsequent downloads.
